@@ -148,7 +148,7 @@ defmodule Membrane.FFmpeg.Transcoder do
     spec = [
       get_child(:transcoder)
       |> via_out(:text, options: [source: ctx.pad_options.source])
-      |> child({:srt_parser, ref}, Transcoder.SrtParsingFilter)
+      |> child({:srt_parser, ref}, Membrane.Subtitles.SRT.Parser)
       |> bin_output(pad)
     ]
 
