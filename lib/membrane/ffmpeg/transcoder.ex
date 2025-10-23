@@ -16,6 +16,19 @@ defmodule Membrane.FFmpeg.Transcoder do
   # the other ones follow.
   @mpeg_ts_pid_base_offset 256
 
+  def_options(
+    wait_random_access_indicator: [
+      spec: boolean(),
+      default: true,
+      description: """
+      If enabled, emits packets only after the random access indicator is found
+      in the MPEG-TS PES stream, otherwise packets are emitted immediately. When
+      enabled, it means that the first video packet that comes out is going to
+      be a keyframe unit.
+      """
+    ]
+  )
+
   def_input_pad(:input,
     availability: :always,
     accepted_format: Membrane.RemoteStream
@@ -128,7 +141,7 @@ defmodule Membrane.FFmpeg.Transcoder do
   )
 
   @impl true
-  def handle_init(_ctx, _opts) do
+  def handle_init(_ctx, opts) do
     spec = [
       bin_input(:input)
       |> child(:transcoder, Transcoder.Filter)
@@ -137,7 +150,9 @@ defmodule Membrane.FFmpeg.Transcoder do
       # We need to check out whats the reason for this and if the transcoder is the problem.
       # In the meanwhile we keep this as a temporary hack.
       |> via_in(:input, toilet_capacity: 3000)
-      |> child(:demuxer, Membrane.MPEG.TS.Demuxer)
+      |> child(:demuxer, %Membrane.MPEG.TS.Demuxer{
+        wait_rai?: opts.wait_random_access_indicator
+      })
     ]
 
     {[spec: spec], %{pid_offset: @mpeg_ts_pid_base_offset}}
