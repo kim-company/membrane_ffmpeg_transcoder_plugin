@@ -131,6 +131,7 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
           ~w(
             -c:v:#{index}
             copy
+            -copyinkf:v:#{index}
             )
         else
           # The +cgop flag is required for HLS as it will produce independent GOPs.
@@ -146,7 +147,7 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
             -g:v:#{index} #{opts.gop_size}
             -rc-lookahead:v:#{index} #{opts.gop_size}
             -sc_threshold 0
-            -pix_fmt yuv420p
+            -pix_fmt:v:#{index} yuv420p
             -force_key_frames:v:#{index} #{"expr:gte(t,n_forced*#{div(opts.gop_size, opts.fps)})"}
             -bf:v:#{index} #{opts.b_frames}
             -maxrate:v:#{index} #{opts.bitrate}
