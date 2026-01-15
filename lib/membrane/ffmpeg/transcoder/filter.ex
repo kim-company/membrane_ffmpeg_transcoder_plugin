@@ -163,12 +163,26 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
             -c:a:#{index} copy
           )
         else
-          ~w(
-            -c:a:#{index} libfdk_aac
-            -b:a:#{index} #{opts.bitrate}
-            -ac:a:#{index} #{opts.channels}
-            -ar:a:#{index} #{opts.sample_rate}
-          )
+          case opts.codec do
+            :opus ->
+              ~w(
+                -c:a:#{index} libopus
+                -b:a:#{index} #{opts.bitrate}
+                -ac:a:#{index} #{opts.channels}
+                -ar:a:#{index} #{opts.sample_rate}
+                -vbr:a:#{index} on
+                -compression_level:a:#{index} 10
+                -application:a:#{index} audio
+              )
+
+            :aac ->
+              ~w(
+                -c:a:#{index} libfdk_aac
+                -b:a:#{index} #{opts.bitrate}
+                -ac:a:#{index} #{opts.channels}
+                -ar:a:#{index} #{opts.sample_rate}
+              )
+          end
         end
       end)
 

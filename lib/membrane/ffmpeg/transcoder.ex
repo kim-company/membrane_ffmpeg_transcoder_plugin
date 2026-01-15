@@ -43,6 +43,11 @@ defmodule Membrane.FFmpeg.Transcoder do
         description: "If enabled, the stream will not be re-encoded",
         default: false
       ],
+      codec: [
+        spec: :aac | :opus,
+        description: "Audio codec to use for encoding. Ignored when copy is true.",
+        default: :aac
+      ],
       bitrate: [
         spec: pos_integer(),
         description: "Maximum bitrate",
