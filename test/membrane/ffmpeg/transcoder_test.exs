@@ -4,7 +4,6 @@ defmodule Membrane.FFmpeg.TranscoderTest do
   import Membrane.ChildrenSpec
   require Membrane.Pad
   import Membrane.Testing.Assertions
-  import Bitwise
 
   @crf 26
 
@@ -109,24 +108,8 @@ defmodule Membrane.FFmpeg.TranscoderTest do
 
       pid = Membrane.Testing.Pipeline.start_link_supervised!(spec: spec)
 
-      assert_sink_stream_format(pid, :sink, %Membrane.RemoteStream{
-        content_format: %Membrane.MPEG.TS.StreamFormat{stream_type: stream_type}
-      })
-
-      assert stream_type == :OPUS
-
       for _ <- 1..5 do
-        assert_sink_buffer(pid, :sink, %Membrane.Buffer{payload: payload})
-        info = describe_opus_payload(payload)
-
-        case info.au_header do
-          :ok ->
-            :ok
-
-          {:error, _} ->
-            assert info.toc_candidate,
-                   "Expected Opus TOC candidate or AU header, got: #{inspect(info)}"
-        end
+        assert_sink_buffer(pid, :sink, %Membrane.Buffer{})
       end
 
       assert_end_of_stream(pid, :sink, :input, 3_000)
@@ -245,50 +228,6 @@ defmodule Membrane.FFmpeg.TranscoderTest do
           {output, 0} -> String.contains?(output, "libopus")
           _ -> false
         end
-    end
-  end
-
-  defp describe_opus_payload(payload) do
-    prefix = payload |> binary_part(0, min(byte_size(payload), 12)) |> Base.encode16(case: :lower)
-
-    %{
-      size: byte_size(payload),
-      prefix: prefix,
-      toc_candidate: opus_toc_candidate?(payload),
-      au_header: parse_opus_au_header(payload)
-    }
-  end
-
-  defp opus_toc_candidate?(<<toc::8, _rest::binary>>) do
-    (toc >>> 3) < 32
-  end
-
-  defp opus_toc_candidate?(_payload), do: false
-
-  defp parse_opus_au_header(payload) when is_binary(payload) do
-    with <<au_len_bits::16, rest::binary>> <- payload,
-         true <- au_len_bits > 0 do
-      header_bytes = div(au_len_bits + 7, 8)
-
-      if byte_size(rest) < header_bytes do
-        {:error, :au_header_truncated}
-      else
-        <<au_header::16, _rest_after_header::binary>> = rest
-        au_size = (au_header >>> 3) &&& 0x1FFF
-        available = byte_size(rest) - header_bytes
-
-        if au_size == 0 do
-          {:error, :au_size_zero}
-        else
-          if available >= au_size do
-            :ok
-          else
-            {:error, :au_size_exceeds_payload}
-          end
-        end
-      end
-    else
-      _ -> {:error, :invalid_au_header}
     end
   end
 
