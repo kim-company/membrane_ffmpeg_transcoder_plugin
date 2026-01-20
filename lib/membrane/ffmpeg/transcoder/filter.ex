@@ -226,13 +226,23 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
         {ports_acc, sel_acc ++ selector, out_acc ++ output}
       end)
 
-    muxer = ~w(
-      -muxpreload 0
-      -muxdelay 0
-      -mpegts_copyts 1
-      -f mpegts
-      -
-    )
+    pcr_period =
+      if video_outputs == [] and audio_outputs != [] do
+        ~w(-pcr_period 40)
+      else
+        []
+      end
+
+    muxer =
+      ~w(
+        -muxpreload 0
+        -muxdelay 0
+        -mpegts_copyts 1
+      ) ++ pcr_period ++
+        ~w(
+          -f mpegts
+          -
+        )
 
     command =
       ~w(#{System.find_executable("ffmpeg")} -y -hide_banner -loglevel warning) ++
