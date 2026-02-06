@@ -48,6 +48,8 @@ defmodule Membrane.FFmpeg.Transcoder.MixProject do
       {:membrane_text_format, "~> 1.0"},
       {:kim_subtitle, "~> 0.1.2"},
       {:membrane_subtitles_plugin, "~> 0.1.0"},
+      {:membrane_h264_format, "~> 0.6"},
+      {:membrane_aac_format, "~> 0.8"},
 
       #
       {:erlexec, "~> 2.0"},
