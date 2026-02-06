@@ -35,7 +35,7 @@ defmodule Membrane.FFmpeg.Transcoder do
   )
 
   def_output_pad(:audio,
-    accepted_format: Membrane.RemoteStream,
+    accepted_format: any_of(Membrane.RemoteStream, Membrane.AAC, Membrane.H264),
     availability: :on_request,
     options: [
       copy: [
@@ -65,7 +65,7 @@ defmodule Membrane.FFmpeg.Transcoder do
   )
 
   def_output_pad(:video,
-    accepted_format: Membrane.RemoteStream,
+    accepted_format: any_of(Membrane.RemoteStream, Membrane.AAC, Membrane.H264),
     availability: :on_request,
     options: [
       copy: [
@@ -134,7 +134,7 @@ defmodule Membrane.FFmpeg.Transcoder do
   )
 
   def_output_pad(:scte,
-    accepted_format: Membrane.RemoteStream,
+    accepted_format: any_of(Membrane.RemoteStream, Membrane.AAC, Membrane.H264),
     availability: :on_request,
     options: [
       pid: [
