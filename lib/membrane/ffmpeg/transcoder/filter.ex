@@ -5,6 +5,9 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
   use Membrane.Filter, flow_control_hints?: false
   require Membrane.Logger
 
+  @ffmpeg_stop_timeout 6_000
+  @ffmpeg_cleanup_timeout 7_000
+
   defmodule FFmpegError do
     defexception [:message]
 
@@ -238,7 +241,8 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
         -muxpreload 0
         -muxdelay 0
         -mpegts_copyts 1
-      ) ++ pcr_period ++
+      ) ++
+        pcr_period ++
         ~w(
           -f mpegts
           -
@@ -276,13 +280,17 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
       "ffmpeg[transcoder]: ffmpeg started: pid=#{inspect(pid)}, ospid=#{inspect(ospid)}"
     )
 
-    Membrane.ResourceGuard.register(ctx.resource_guard, fn ->
-      Membrane.Logger.info(
-        "ffmpeg[transcoder]: resource guard called, closing ffmpeg: pid=#{inspect(pid)}, ospid=#{inspect(ospid)}"
-      )
+    Membrane.ResourceGuard.register(
+      ctx.resource_guard,
+      fn ->
+        Membrane.Logger.info(
+          "ffmpeg[transcoder]: resource guard called, closing ffmpeg: pid=#{inspect(pid)}, ospid=#{inspect(ospid)}"
+        )
 
-      :exec.stop_and_wait(ospid, 5_000)
-    end)
+        stop_ffmpeg(pid)
+      end,
+      timeout: @ffmpeg_cleanup_timeout
+    )
 
     state = %{state | ffmpeg: %{pid: pid, ospid: ospid}, text_ports: text_ports}
 
@@ -292,6 +300,22 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
       |> Enum.map(&{:stream_format, {&1, %Membrane.RemoteStream{}}})
 
     {[{:stream_format, {:ts, %Membrane.RemoteStream{}}} | text_formats], state}
+  end
+
+  @doc false
+  def stop_ffmpeg(pid) do
+    # ResourceGuard runs cleanup in a new task. erlexec's original monitor sends
+    # DOWN only to the process that started FFmpeg, so the task needs its own.
+    monitor = Process.monitor(pid)
+
+    try do
+      case :exec.stop_and_wait(pid, @ffmpeg_stop_timeout) do
+        {:error, :timeout} -> raise "FFmpeg did not stop within #{@ffmpeg_stop_timeout}ms"
+        _exit_status -> :ok
+      end
+    after
+      Process.demonitor(monitor, [:flush])
+    end
   end
 
   @impl true
