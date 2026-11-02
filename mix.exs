@@ -2,17 +2,19 @@ defmodule Membrane.FFmpeg.Transcoder.MixProject do
   use Mix.Project
 
   @github_url "https://github.com/kim-company/membrane_ffmpeg_transcoder_plugin"
+  @version "1.7.0"
 
   def project do
     [
       app: :membrane_ffmpeg_transcoder_plugin,
-      version: "1.6.2",
+      version: @version,
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       source_url: @github_url,
       name: "Membrane FFmpeg Transcoder Plugin",
       description: description(),
       package: package(),
+      docs: [extras: ["README.md", "CHANGELOG.md"], main: "readme", source_ref: "v#{@version}"],
       deps: deps()
     ]
   end
@@ -20,7 +22,7 @@ defmodule Membrane.FFmpeg.Transcoder.MixProject do
   defp package do
     [
       maintainers: ["KIM Keep In Mind"],
-      files: ~w(lib mix.exs README.md LICENSE),
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE),
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @github_url}
     ]

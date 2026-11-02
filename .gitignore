@@ -21,6 +21,7 @@ erl_crash.dump
 
 # Ignore package tarball (built via "mix hex.build").
 membrane_ffmpeg_transcoder-*.tar
+membrane_ffmpeg_transcoder_plugin-*.tar
 
 # Temporary files, for example, from tests.
 /tmp/

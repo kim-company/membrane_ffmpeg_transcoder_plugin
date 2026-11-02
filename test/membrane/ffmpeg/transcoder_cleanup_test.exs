@@ -27,11 +27,13 @@ defmodule Membrane.FFmpeg.TranscoderCleanupTest do
     assert Task.await(cleanup, 2_000) == :ok
   end
 
-  test "cleanup allows the five-second grace period before a forced exit" do
+  test "cleanup waits for a forced exit when the process ignores TERM" do
     {:ok, pid, os_pid} =
       :exec.run(
         [System.find_executable("sh"), "-c", "trap '' TERM; printf ready; exec sleep 30"],
-        [:monitor, :stdout, {:kill, "kill -s TERM ${CHILD_PID}"}, {:kill_timeout, 5}]
+        # Exercise the real forced-exit path with a shorter process grace period.
+        # FFmpeg's production grace period remains five seconds.
+        [:monitor, :stdout, {:kill, "kill -s TERM ${CHILD_PID}"}, {:kill_timeout, 1}]
       )
 
     on_exit(fn -> :exec.stop(pid) end)
@@ -42,7 +44,7 @@ defmodule Membrane.FFmpeg.TranscoderCleanupTest do
     assert Process.alive?(pid)
 
     cleanup = Task.async(fn -> Filter.stop_ffmpeg(pid) end)
-    assert Task.await(cleanup, 7_000) == :ok
+    assert Task.await(cleanup, 3_000) == :ok
     assert_receive {:DOWN, ^os_pid, :process, ^pid, _reason}, 1_000
     refute Process.alive?(pid)
   end

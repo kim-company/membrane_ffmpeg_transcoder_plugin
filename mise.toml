@@ -1,3 +1,4 @@
 [tools]
 elixir = "1.18.3-otp-27"
 erlang = "27.2.1"
+ffmpeg = { version = "8.0.1", install_env = { ASDF_FFMPEG_ENABLE = "gpl nonfree libopus libfdk-aac libx264 libzvbi" } }

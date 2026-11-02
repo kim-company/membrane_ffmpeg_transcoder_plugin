@@ -4,7 +4,10 @@ defmodule Membrane.FFmpeg.TranscoderTest do
   import Membrane.ChildrenSpec
   require Membrane.Pad
   import Membrane.Testing.Assertions
+  import ExUnit.CaptureLog
 
+  @moduletag timeout: 15_000
+  @eos_timeout 10_000
   @crf 26
 
   @input_path "test/data/av-sync-test.ts"
@@ -69,6 +72,27 @@ defmodule Membrane.FFmpeg.TranscoderTest do
     ]
   ]
 
+  setup_all do
+    for executable <- ["ffmpeg", "ffprobe"] do
+      assert System.find_executable(executable),
+             "#{executable} is required; run mise install before running the integration tests"
+    end
+
+    for {option, required} <- [
+          {"-encoders", ~w(libx264 libfdk_aac libopus)},
+          {"-decoders", ~w(libzvbi_teletextdec)}
+        ] do
+      {output, status} = System.cmd("ffmpeg", ["-hide_banner", option], stderr_to_stdout: true)
+      assert status == 0, "ffmpeg #{option} failed:\n#{output}"
+      missing = Enum.reject(required, &String.contains?(output, &1))
+
+      assert missing == [],
+             "FFmpeg is missing #{Enum.join(missing, ", ")}; use the full build pinned in mise.toml"
+    end
+
+    :ok
+  end
+
   @tag :tmp_dir
   test "copy", %{tmp_dir: tmp_dir} do
     spec = [
@@ -88,32 +112,82 @@ defmodule Membrane.FFmpeg.TranscoderTest do
     ]
 
     pid = Membrane.Testing.Pipeline.start_link_supervised!(spec: spec)
-    assert_end_of_stream(pid, {:sink, :video}, :input, 3_000)
-    assert_end_of_stream(pid, {:sink, :sd}, :input, 3_000)
-    assert_end_of_stream(pid, {:sink, :audio}, :input, 3_000)
+
+    for output <- [:video, :sd, :audio] do
+      assert_end_of_stream(pid, {:sink, ^output}, :input, @eos_timeout)
+    end
+
+    for filename <- ["video.h264", "sd.h264", "audio.aac"] do
+      assert File.stat!(Path.join(tmp_dir, filename)).size > 0
+    end
   end
 
   test "transcodes audio to Opus" do
-    unless opus_encoder_available?() do
-      IO.warn("Skipping Opus transcoding test: ffmpeg does not report libopus encoder")
-    else
-      spec = [
-        child(:source, %Membrane.File.Source{
-          location: @input_path
-        })
-        |> child(:transcoder, Membrane.FFmpeg.Transcoder)
-        |> via_out(:audio, options: [codec: :opus, bitrate: 96_000, sample_rate: 48_000, channels: 2])
-        |> child(:sink, Membrane.Testing.Sink)
-      ]
+    spec = [
+      child(:source, %Membrane.File.Source{
+        location: @input_path
+      })
+      |> child(:transcoder, Membrane.FFmpeg.Transcoder)
+      |> via_out(:audio,
+        options: [codec: :opus, bitrate: 96_000, sample_rate: 48_000, channels: 2]
+      )
+      |> child(:sink, Membrane.Testing.Sink)
+    ]
 
-      pid = Membrane.Testing.Pipeline.start_link_supervised!(spec: spec)
+    pid = Membrane.Testing.Pipeline.start_link_supervised!(spec: spec)
+    assert_end_of_stream(pid, :sink, :input, @eos_timeout)
 
-      for _ <- 1..5 do
-        assert_sink_buffer(pid, :sink, %Membrane.Buffer{})
-      end
-
-      assert_end_of_stream(pid, :sink, :input, 3_000)
+    for _ <- 1..5 do
+      assert_sink_buffer(pid, :sink, %Membrane.Buffer{payload: payload}, 0)
+      assert byte_size(payload) > 0
     end
+  end
+
+  @tag :tmp_dir
+  test "finishes at EOF despite a damaged final video frame", %{tmp_dir: tmp_dir} do
+    # The final video PES starts at packet 960. Keep its first TS packet,
+    # truncating the last frame while preserving the preceding three seconds.
+    payload = File.read!(@input_path) |> binary_part(0, 188 * 961)
+    output_path = Path.join(tmp_dir, "truncated.h264")
+
+    logs =
+      capture_log(fn ->
+        spec =
+          child(:source, %Membrane.Testing.Source{output: [payload]})
+          |> child(:transcoder, Membrane.FFmpeg.Transcoder)
+          |> via_out(:video, options: @video_outputs[:sd])
+          |> child(:sink, %Membrane.File.Sink{location: output_path})
+
+        pid = Membrane.Testing.Pipeline.start_link_supervised!(spec: spec)
+        assert_end_of_stream(pid, :sink, :input, @eos_timeout)
+        assert Process.alive?(pid)
+      end)
+
+    # Establish that this actually exercised a decoder error, rather than
+    # merely a shorter valid stream, and that FFmpeg nevertheless exited zero.
+    assert logs =~ "error while decoding"
+    assert logs =~ "exited with reason: :normal"
+
+    {frames, status} =
+      System.cmd(
+        "ffprobe",
+        [
+          "-v",
+          "error",
+          "-count_frames",
+          "-select_streams",
+          "v:0",
+          "-show_entries",
+          "stream=nb_read_frames",
+          "-of",
+          "csv=p=0",
+          output_path
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, frames
+    assert frames |> String.trim() |> String.to_integer() >= 45
   end
 
   @tag :tmp_dir
@@ -134,35 +208,44 @@ defmodule Membrane.FFmpeg.TranscoderTest do
     ]
 
     pid = Membrane.Testing.Pipeline.start_link_supervised!(spec: spec)
-    assert_end_of_stream(pid, {:sink, :video}, :input, 3_000)
-    assert_end_of_stream(pid, {:sink, :audio}, :input, 3_000)
-    assert_end_of_stream(pid, {:sink, :scte}, :input, 3_000)
 
-    assert_sink_buffer(
-      pid,
-      {:sink, :scte},
-      %Membrane.Buffer{
-        payload:
-          <<0, 252, 48, 37, 0, 0, 0, 0, 0, 0, 0, 255, 240, 20, 5, 0, 0, 0, 100, 127, 239, 254, 0,
-            82, 101, 192, 126, 0, 82, 101, 192, 0, 1, 18, 255, 0, 0, 93, 125, 122, 192>>,
-        dts: 56_080_000_000,
-        pts: nil
-      },
-      5_000
-    )
+    for output <- [:video, :audio, :scte] do
+      assert_end_of_stream(pid, {:sink, ^output}, :input, @eos_timeout)
+    end
 
-    assert_sink_buffer(
-      pid,
-      {:sink, :scte},
-      %Membrane.Buffer{
-        payload:
-          <<0, 252, 48, 32, 0, 0, 0, 0, 0, 0, 0, 255, 240, 15, 5, 0, 0, 0, 100, 127, 79, 254, 0,
-            164, 203, 128, 0, 1, 18, 255, 0, 0, 108, 20, 127, 68>>,
-        dts: 116_280_000_000,
-        pts: nil
-      },
-      5_000
-    )
+    # FFmpeg versions may change the section framing and descriptors. Verify
+    # every cue's meaning and timing rather than one muxer's byte representation.
+    for {event_id, splice_time, out_of_network, break_duration} <- [
+          {100, 60_000_000_000, 1, %{auto_return: 0, duration: 60_000_000_000}},
+          {100, 120_000_000_000, 0, nil},
+          {101, 180_000_000_000, 1, %{auto_return: 0, duration: 60_000_000_000}}
+        ] do
+      assert_sink_buffer(pid, {:sink, :scte}, %Membrane.Buffer{} = buffer, 0)
+
+      assert {:ok,
+              %MPEG.TS.PSI{
+                table_type: :scte35,
+                table: %MPEG.TS.SCTE35{
+                  protocol_version: 0,
+                  encrypted_packet: 0,
+                  pts_adjustment: 0,
+                  splice_command_type: :splice_insert,
+                  splice_command: %MPEG.TS.SCTE35.SpliceInsert{
+                    event_id: ^event_id,
+                    cancel_indicator: 0,
+                    out_of_network_indicator: ^out_of_network,
+                    splice_time: %{pts: ^splice_time},
+                    break_duration: ^break_duration
+                  }
+                }
+              }} = MPEG.TS.PSI.unmarshal(buffer.payload, true)
+
+      assert is_integer(buffer.dts)
+      assert buffer.dts < splice_time
+      assert splice_time - buffer.dts < 5_000_000_000
+    end
+
+    refute_sink_buffer(pid, {:sink, :scte}, %Membrane.Buffer{}, 0)
   end
 
   @tag :tmp_dir
@@ -183,9 +266,10 @@ defmodule Membrane.FFmpeg.TranscoderTest do
     ]
 
     pid = Membrane.Testing.Pipeline.start_link_supervised!(spec: spec)
-    assert_end_of_stream(pid, {:sink, :video}, :input, 3_000)
-    assert_end_of_stream(pid, {:sink, :audio}, :input, 3_000)
-    assert_end_of_stream(pid, {:sink, :text}, :input, 3_000)
+
+    for output <- [:video, :audio, :text] do
+      assert_end_of_stream(pid, {:sink, ^output}, :input, @eos_timeout)
+    end
 
     assert_sink_buffer(
       pid,
@@ -194,7 +278,7 @@ defmodule Membrane.FFmpeg.TranscoderTest do
         payload: "♪ Mit Zucker lacht das Leben ♪",
         pts: 2_342_000_000
       },
-      5_000
+      0
     )
 
     assert_sink_buffer(
@@ -204,7 +288,7 @@ defmodule Membrane.FFmpeg.TranscoderTest do
         payload: "Alte Werbespots stellen Zucker\nals Kraftspender dar.",
         pts: 4_842_000_000
       },
-      5_000
+      0
     )
 
     assert_sink_buffer(
@@ -214,21 +298,8 @@ defmodule Membrane.FFmpeg.TranscoderTest do
         payload: "Auch in den 70ern\nist sein Ruf noch gut.",
         pts: 9_742_000_000
       },
-      5_000
+      0
     )
-  end
-
-  defp opus_encoder_available? do
-    case System.find_executable("ffmpeg") do
-      nil ->
-        false
-
-      ffmpeg ->
-        case System.cmd(ffmpeg, ["-hide_banner", "-encoders"]) do
-          {output, 0} -> String.contains?(output, "libopus")
-          _ -> false
-        end
-    end
   end
 
   @tag :tmp_dir
@@ -275,14 +346,14 @@ defmodule Membrane.FFmpeg.TranscoderTest do
     @video_outputs
     |> Enum.each(fn {id, opts} ->
       id = "v_#{id}"
-      assert_end_of_stream(pid, {:sink, ^id}, :input, 60_000)
+      assert_end_of_stream(pid, {:sink, ^id}, :input, @eos_timeout)
       assert_video_properties("#{tmp_dir}/#{id}.mp4", opts)
     end)
 
     @audio_outputs
     |> Enum.each(fn {id, opts} ->
       id = "a_#{id}"
-      assert_end_of_stream(pid, {:sink, ^id}, :input, 60_000)
+      assert_end_of_stream(pid, {:sink, ^id}, :input, @eos_timeout)
       assert_audio_properties("#{tmp_dir}/#{id}.mp4", opts)
     end)
   end
@@ -317,17 +388,16 @@ defmodule Membrane.FFmpeg.TranscoderTest do
     assert stream["codec_name"] == "aac"
     assert String.to_integer(stream["bit_rate"]) <= opts[:bitrate]
     assert String.to_integer(stream["sample_rate"]) == opts[:sample_rate]
+    assert stream["channels"] == opts[:channels]
   end
 
   defp ffprobe(path) do
-    ~w(ffprobe -show_streams -of json #{path})
-    |> Enum.join(" ")
-    |> :exec.run([:sync, {:stderr, :null}, :stdout])
-    |> then(fn {:ok, elems} ->
-      elems
-      |> Keyword.fetch!(:stdout)
-      |> Enum.into(<<>>)
-      |> JSON.decode!()
-    end)
+    {output, status} =
+      System.cmd("ffprobe", ["-v", "error", "-show_streams", "-of", "json", path],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, "ffprobe failed for #{path}:\n#{output}"
+    JSON.decode!(output)
   end
 end

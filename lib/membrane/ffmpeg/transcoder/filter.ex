@@ -7,6 +7,25 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
 
   @ffmpeg_stop_timeout 6_000
   @ffmpeg_cleanup_timeout 7_000
+  @ffmpeg_cleanup_tag :ffmpeg_process
+
+  # Keep a writer open until FFmpeg exits, including when it never opens its
+  # subtitle output. The child inherits that writer until its read-only open
+  # completes, so closing stdin cannot race the reader's startup. Closing the
+  # writer then lets cat drain to EOF; wait keeps its stdout ahead of DOWN.
+  @text_reader_script """
+  set -e
+  exec 3<>"$1"
+  (
+    exec 4<"$1"
+    exec 3>&-
+    exec "$2" <&4
+  ) &
+  reader=$!
+  while IFS= read -r _; do :; done
+  exec 3>&-
+  wait "$reader"
+  """
 
   defmodule FFmpegError do
     defexception [:message]
@@ -52,8 +71,9 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
      %{
        ffmpeg: nil,
        closing: false,
+       eos_sent?: false,
        outputs: %{video: [], audio: [], scte: []},
-       text_ports: %{}
+       text_readers: %{}
      }}
   end
 
@@ -196,26 +216,12 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
         ~w(-streamid #{index}:#{sid})
       end)
 
-    {text_ports, text_selectors, text_outputs} =
+    {text_readers, text_selectors, text_outputs} =
       ctx
       |> text_pads()
       |> Enum.with_index()
-      |> Enum.reduce({%{}, [], []}, fn {pad, idx}, {ports_acc, sel_acc, out_acc} ->
-        fifo = make_fifo!("text_#{idx}.fifo")
-
-        # TODO
-        # erlexec here as well? Ports are leaked this way apparently.
-        port = Port.open({:spawn, "cat #{fifo}"}, [:binary])
-
-        Membrane.ResourceGuard.register(ctx.resource_guard, fn ->
-          try do
-            Port.close(port)
-          rescue
-            _e -> :ok
-          after
-            File.rm(fifo)
-          end
-        end)
+      |> Enum.reduce({%{}, [], []}, fn {pad, idx}, {readers_acc, sel_acc, out_acc} ->
+        reader = start_text_reader!(ctx.resource_guard, pad)
 
         selector =
           case ctx.pads[pad].options.source do
@@ -223,10 +229,10 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
               ~w(-txt_format text -fix_sub_duration -txt_page #{page_number})
           end
 
-        output = ~w(-map 0:s:#{idx}? -f srt #{fifo})
+        output = ["-map", "0:s:#{idx}?", "-f", "srt", reader.fifo]
 
-        ports_acc = Map.put(ports_acc, port, %{fifo: fifo, pad: pad})
-        {ports_acc, sel_acc ++ selector, out_acc ++ output}
+        readers_acc = Map.put(readers_acc, reader.ospid, reader)
+        {readers_acc, sel_acc ++ selector, out_acc ++ output}
       end)
 
     pcr_period =
@@ -249,7 +255,8 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
         )
 
     command =
-      ~w(#{System.find_executable("ffmpeg")} -y -hide_banner -loglevel warning) ++
+      [executable!("ffmpeg")] ++
+        ~w(-y -hide_banner -loglevel warning) ++
         text_selectors ++
         ~w(-i - -copyts) ++
         filtercomplex ++ mappings ++ vcodec ++ acodec ++ sid_mapping ++ muxer ++ text_outputs
@@ -289,10 +296,11 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
 
         stop_ffmpeg(pid)
       end,
-      timeout: @ffmpeg_cleanup_timeout
+      timeout: @ffmpeg_cleanup_timeout,
+      tag: @ffmpeg_cleanup_tag
     )
 
-    state = %{state | ffmpeg: %{pid: pid, ospid: ospid}, text_ports: text_ports}
+    state = %{state | ffmpeg: %{pid: pid, ospid: ospid}, text_readers: text_readers}
 
     text_formats =
       ctx
@@ -321,7 +329,7 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
   @impl true
   def handle_buffer(_pad, buffer, _ctx, state = %{ffmpeg: nil}) do
     Membrane.Logger.warning(
-      "ffmpeg[transcoder]: dropping #{length(buffer.payload)} bytes as ffmpeg is not running"
+      "ffmpeg[transcoder]: dropping #{byte_size(buffer.payload)} bytes as ffmpeg is not running"
     )
 
     {[], state}
@@ -334,10 +342,12 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
 
   @impl true
   def handle_end_of_stream(_pad, ctx, state = %{ffmpeg: nil}) do
-    forward_end_of_stream(ctx, state)
+    maybe_end_of_stream(ctx, %{state | closing: true})
   end
 
-  def handle_end_of_stream(_pad, _ctx, state = %{closing: false}) do
+  def handle_end_of_stream(_pad, _ctx, state = %{closing: true}), do: {[], state}
+
+  def handle_end_of_stream(_pad, _ctx, state) do
     # Wait for the DOWN message before sending this one out.
     {[], close_ffmpeg(state)}
   end
@@ -347,10 +357,16 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
     {[buffer: {:ts, %Membrane.Buffer{payload: payload}}], state}
   end
 
-  def handle_info({port, {:data, payload}}, _ctx, state)
-      when is_map_key(state.text_ports, port) do
-    pad = state.text_ports[port].pad
+  def handle_info({:stdout, ospid, payload}, _ctx, state)
+      when is_map_key(state.text_readers, ospid) do
+    pad = state.text_readers[ospid].pad
     {[buffer: {pad, %Membrane.Buffer{payload: payload}}], state}
+  end
+
+  def handle_info({:stderr, ospid, payload}, _ctx, state)
+      when is_map_key(state.text_readers, ospid) do
+    Membrane.Logger.warning("ffmpeg[text reader]: #{String.trim(payload)}")
+    {[], state}
   end
 
   def handle_info(
@@ -358,22 +374,34 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
         ctx,
         state = %{ffmpeg: %{ospid: ospid}}
       ) do
-    reason =
-      case reason do
-        :normal ->
-          :normal
-
-        {:status, status} ->
-          :exec.status(status)
-
-        {:exit_status, code} ->
-          {:status, code}
-      end
+    reason = normalize_exit_reason(reason)
 
     level = if state.closing or reason == :normal, do: :info, else: :error
     Membrane.Logger.log(level, "ffmpeg[transcoder]: exited with reason: #{inspect(reason)}")
 
-    forward_end_of_stream(ctx, state)
+    Membrane.ResourceGuard.unregister(ctx.resource_guard, @ffmpeg_cleanup_tag)
+
+    Enum.each(state.text_readers, fn {_ospid, reader} ->
+      :ok = :exec.send(reader.ospid, :eof)
+    end)
+
+    notification =
+      {:transcoder_exited, %{reason: reason, input_eos_received?: state.closing}}
+
+    {actions, state} = maybe_end_of_stream(ctx, %{state | ffmpeg: nil})
+    {[notify_parent: notification] ++ actions, state}
+  end
+
+  def handle_info({:DOWN, ospid, :process, _pid, reason}, ctx, state)
+      when is_map_key(state.text_readers, ospid) do
+    if state.ffmpeg != nil or normalize_exit_reason(reason) != :normal do
+      raise FFmpegError, {:text_reader_exited, normalize_exit_reason(reason)}
+    end
+
+    {reader, readers} = Map.pop(state.text_readers, ospid)
+    Membrane.ResourceGuard.unregister(ctx.resource_guard, reader.cleanup_tag)
+    File.rm_rf!(Path.dirname(reader.fifo))
+    maybe_end_of_stream(ctx, %{state | text_readers: readers})
   end
 
   def handle_info(msg, _ctx, state) do
@@ -387,26 +415,53 @@ defmodule Membrane.FFmpeg.Transcoder.Filter do
     |> Enum.filter(&match?(Pad.ref(:text, _), &1))
   end
 
-  defp make_fifo!(name) do
-    dir = Path.join([System.tmp_dir!(), "membrane_ffmpeg_transcoder"])
-    File.mkdir_p!(dir)
-    path = Path.join(dir, name)
-    _ = File.rm(path)
-    {_, 0} = System.cmd("mkfifo", [path])
-    path
+  defp start_text_reader!(resource_guard, pad) do
+    base = Path.join(System.tmp_dir!(), "membrane_ffmpeg_transcoder")
+    File.mkdir_p!(base)
+    dir = Path.join(base, "#{System.pid()}-#{System.unique_integer([:positive, :monotonic])}")
+    File.mkdir!(dir)
+    tag = Membrane.ResourceGuard.register(resource_guard, fn -> File.rm_rf!(dir) end)
+    fifo = Path.join(dir, "text.fifo")
+    {_, 0} = System.cmd("mkfifo", [fifo], stderr_to_stdout: true)
+
+    {:ok, pid, ospid} =
+      :exec.run(
+        [executable!("sh"), "-c", @text_reader_script, "text-reader", fifo, executable!("cat")],
+        [:stdin, :stdout, :stderr, :monitor, {:group, 0}, :kill_group, {:kill_timeout, 1}]
+      )
+
+    Membrane.ResourceGuard.register(resource_guard, fn -> stop_ffmpeg(pid) end,
+      tag: tag,
+      timeout: @ffmpeg_cleanup_timeout
+    )
+
+    %{pid: pid, ospid: ospid, fifo: fifo, pad: pad, cleanup_tag: tag}
   end
+
+  defp executable!(name),
+    do: System.find_executable(name) || raise(FFmpegError, "Executable not found: #{name}")
+
+  defp normalize_exit_reason(:normal), do: :normal
+
+  defp normalize_exit_reason({kind, status}) when kind in [:status, :exit_status],
+    do: :exec.status(status)
+
+  defp normalize_exit_reason(reason), do: reason
 
   defp close_ffmpeg(state) do
     :exec.send(state.ffmpeg.ospid, :eof)
     put_in(state, [:closing], true)
   end
 
-  defp forward_end_of_stream(ctx, state) do
+  defp maybe_end_of_stream(ctx, %{ffmpeg: nil, text_readers: readers, eos_sent?: false} = state)
+       when map_size(readers) == 0 do
     text_eos =
       ctx
       |> text_pads()
       |> Enum.map(&{:end_of_stream, &1})
 
-    {[{:end_of_stream, :ts} | text_eos], put_in(state, [:ffmpeg], nil)}
+    {[{:end_of_stream, :ts} | text_eos], %{state | eos_sent?: true}}
   end
+
+  defp maybe_end_of_stream(_ctx, state), do: {[], state}
 end

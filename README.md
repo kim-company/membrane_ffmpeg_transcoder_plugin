@@ -4,9 +4,64 @@
 Membrane plugin to transcode video into different qualities using FFmpeg.
 
 ## Requirements
-- ffmpeg
+- FFmpeg with `libx264` for video encoding, `libfdk_aac` for AAC, and `libopus`
+  for Opus (depending on the outputs used).
+- The `libzvbi_teletextdec` decoder for teletext subtitle extraction.
+
+## Development and tests
+
+The tool versions and FFmpeg codec build flags used for development are pinned in
+`mise.toml`. Building FFmpeg requires a compiler and the native development
+libraries for x264, FDK AAC, Opus, and zvbi. With those installed, run `mise install`
+and then:
+
+```sh
+mix deps.get
+mix test
+```
+
+The integration tests also require `ffprobe`. They check FFmpeg's encoders and
+decoders before starting any pipelines and report missing capabilities directly.
+Some distribution builds of FFmpeg omit `libfdk_aac` or `libzvbi`; check the
+installed build with `ffmpeg -hide_banner -encoders` and
+`ffmpeg -hide_banner -decoders`.
+
+Passing tests stay quiet. Logs, including FFmpeg commands and warnings, are
+captured and printed on failure. Use `mix test --slowest 10` for per-test timings.
+
+The audio/video fixture is three seconds long; it covers the full quality ladder
+without encoding the original 30-second clip on every run. The subtitle and
+SCTE-35 fixtures retain their complete timelines.
 
 ## Usage
+
+### Process exit and recovery
+
+The public bin sends its parent this notification when it observes FFmpeg exiting:
+
+```elixir
+{:transcoder_exited,
+ %{reason: {:signal, :sigkill, false}, input_eos_received?: false}}
+```
+
+The reason is `:normal` for exit zero, `{:status, code}` for a nonzero exit, or
+`{:signal, signal, core_dump?}` for a signal. Infrastructure failures can report
+another reason, such as `:port_closed`. The boolean records whether input EOS had
+reached the FFmpeg filter when it observed the exit; it does not establish success.
+
+The bin still emits output EOS after its readers drain, including after nonzero
+exits. The notification and output EOS can reach the application in either order.
+Process exit does not establish downstream sink completion, recording durability,
+or valid/complete media. Applications should coordinate their sinks and apply their
+own drain deadline before replacing a graph.
+
+Each bin represents one run: FFmpeg is never restarted internally. Applications
+own recovery through supervision. Internal reader/element failures still propagate
+as OTP failures. Monitor or supervise the graph too: no exit notification is
+guaranteed if the bin is being removed or has crashed.
+
+Subtitle readers and FIFOs belong to their individual runs. They drain on process
+exit and are cleaned up on normal completion or graph teardown.
 
 ### Basic Multi-Quality Transcoding
 
@@ -94,5 +149,5 @@ spec = [
 
 ## Copyright and License
 Copyright 2024, [KIM Keep In Mind GmbH](https://www.keepinmind.info/)
-Licensed under the [Apache License, Version 2.0](LICENSE)
+Licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0)
 

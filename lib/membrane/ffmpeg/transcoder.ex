@@ -6,6 +6,33 @@ defmodule Membrane.FFmpeg.Transcoder do
   Input might be MPEG-TS or FLV but other streaming containers might work as well. If the
   input stream contains more than 1 video and 1 audio stream, which one will be picked is
   undefined behaviour.
+
+  ## Process lifecycle
+
+  Each bin runs FFmpeg once. When the bin observes that process exiting, it sends
+  its parent one notification:
+
+      {:transcoder_exited, %{reason: reason, input_eos_received?: boolean}}
+
+  `reason` is `:normal` for exit zero, `{:status, code}` for a nonzero exit,
+  or `{:signal, signal, core_dump?}` for termination by signal. Infrastructure
+  failures may carry another reason, such as `:port_closed`.
+
+  `input_eos_received?` records whether the FFmpeg filter had handled input EOS
+  when it observed the exit. It is an observation, not a success classification.
+  An exit can be abnormal even after input EOS; decoder warnings can also occur
+  before a successful exit.
+
+  Process exit does not mean that the media outputs or downstream sinks have
+  finished. The bin preserves output EOS for normal and abnormal FFmpeg exits,
+  after its readers have drained. The notification and individual output EOS
+  travel through different processes; callers must tolerate either arrival order
+  and use downstream completion to coordinate draining.
+
+  The bin never restarts FFmpeg. Its parent owns recovery, drain deadlines, and
+  any replacement run. Internal element/reader failures still use ordinary OTP
+  failure propagation. The notification is not guaranteed during bin teardown
+  or a bin crash; callers must also supervise or monitor their media graph.
   """
   use Membrane.Bin, flow_control_hints?: false
   alias Membrane.FFmpeg.Transcoder
@@ -189,4 +216,16 @@ defmodule Membrane.FFmpeg.Transcoder do
        notify_child: {:transcoder, {:stream_added, {Pad.name_by_ref(pad), pid}, ctx.pad_options}}
      ], state}
   end
+
+  @impl true
+  def handle_child_notification(
+        {:transcoder_exited, _details} = notification,
+        :transcoder,
+        _ctx,
+        state
+      ) do
+    {[notify_parent: notification], state}
+  end
+
+  def handle_child_notification(_notification, _child, _ctx, state), do: {[], state}
 end
